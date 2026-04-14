@@ -1,3 +1,4 @@
+use chrono::prelude::*;
 use crossterm::{
     event::{self, Event, KeyCode},
     execute,
@@ -36,10 +37,23 @@ fn init_db(conn: &Connection) -> Result<()> {
             stdout       TEXT,
             stderr       TEXT,
             hostname     TEXT,
-            shell        TEXT
+            shell        TEXT,
+            tags         TEXT
         );
     ",
     )?;
+
+    // Handle migrations
+    let columns: Result<Vec<String>> = conn
+        .prepare("PRAGMA table_info(sessions)")?
+        .query_map([], |row| row.get(1))?
+        .collect();
+
+    let columns = columns?;
+    if !columns.contains(&"tags".to_string()) {
+        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN tags TEXT", []);
+    }
+
     Ok(())
 }
 
@@ -49,6 +63,9 @@ fn capture_session(conn: &Connection, args: &[String]) -> Result<()> {
     let exit_code = args.get(4).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
     let git_branch = args.get(5).cloned().unwrap_or_default();
     let git_repo = args.get(6).cloned().unwrap_or_default();
+    let duration = args.get(7).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+    let stdout = args.get(8).cloned().unwrap_or_default();
+    let stderr = args.get(9).cloned().unwrap_or_default();
 
     if command.is_empty() {
         return Ok(());
@@ -66,10 +83,12 @@ fn capture_session(conn: &Connection, args: &[String]) -> Result<()> {
 
     conn.execute(
         "INSERT INTO sessions
-            (timestamp, command, cwd, git_repo, git_branch, exit_code, hostname, shell)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            (timestamp, command, cwd, git_repo, git_branch, exit_code,
+             duration_ms, stdout, stderr, hostname, shell)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         rusqlite::params![
-            timestamp, command, cwd, git_repo, git_branch, exit_code, hostname, "bash"
+            timestamp, command, cwd, git_repo, git_branch, exit_code, duration, stdout, stderr,
+            hostname, "bash"
         ],
     )?;
     Ok(())
@@ -81,54 +100,90 @@ struct Session {
     command: String,
     cwd: String,
     exit_code: i64,
-    git_repo: String,
     git_branch: String,
+    stdout: String,
 }
 
 fn format_time(timestamp_ms: i64) -> String {
-    let secs = timestamp_ms / 1000;
-    let hours = (secs % 86400) / 3600;
-    let minutes = (secs % 3600) / 60;
-    let seconds = secs % 60;
-    let days = secs / 86400;
-    let year = 1970 + days / 365;
-    let doy = days % 365;
-    let month = doy / 30 + 1;
-    let day = doy % 30 + 1;
-    format!(
-        "{}-{:02}-{:02} {:02}:{:02}:{:02}",
-        year, month, day, hours, minutes, seconds
-    )
+    let dt = DateTime::<Utc>::from_timestamp_millis(timestamp_ms)
+        .unwrap_or_default()
+        .with_timezone(&Local);
+    dt.format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
-fn search_sessions(conn: &Connection, query: &str) -> Result<Vec<Session>> {
+fn search_sessions(
+    conn: &Connection,
+    query: &str,
+    failed_only: bool,
+    today_only: bool,
+) -> Result<Vec<Session>> {
     let pattern = format!("%{}%", query);
-    let mut stmt = conn.prepare(
+
+    let today_start = if today_only {
+        let now = Local::now();
+        let midnight = now.date_naive().and_hms_opt(0, 0, 0).unwrap();
+        Local
+            .from_local_datetime(&midnight)
+            .unwrap()
+            .timestamp_millis()
+    } else {
+        0
+    };
+
+    let sql = format!(
         "SELECT id, timestamp, command, cwd, exit_code,
-                COALESCE(git_repo,''), COALESCE(git_branch,'')
+                COALESCE(git_branch,''), COALESCE(stdout,'')
          FROM sessions
-         WHERE command LIKE ?1
+         WHERE (command LIKE ?1 OR COALESCE(stdout,'') LIKE ?1)
+         {}
+         {}
          ORDER BY timestamp DESC
          LIMIT 50",
-    )?;
+        if failed_only {
+            "AND exit_code != 0"
+        } else {
+            ""
+        },
+        if today_only {
+            "AND timestamp >= ?2"
+        } else {
+            ""
+        },
+    );
 
-    let rows = stmt.query_map([&pattern], |row| {
-        Ok(Session {
-            id: row.get(0)?,
-            timestamp: row.get(1)?,
-            command: row.get(2)?,
-            cwd: row.get(3)?,
-            exit_code: row.get(4)?,
-            git_repo: row.get(5)?,
-            git_branch: row.get(6)?,
-        })
-    })?;
+    let mut stmt = conn.prepare(&sql)?;
 
-    let mut results = Vec::new();
-    for row in rows {
-        results.push(row?);
-    }
-    Ok(results)
+    let rows = if today_only {
+        stmt.query_map(rusqlite::params![pattern, today_start], |row| {
+            Ok(Session {
+                id: row.get(0)?,
+                timestamp: row.get(1)?,
+                command: row.get(2)?,
+                cwd: row.get(3)?,
+                exit_code: row.get(4)?,
+                git_branch: row.get(5)?,
+                stdout: row.get(6)?,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect()
+    } else {
+        stmt.query_map(rusqlite::params![pattern], |row| {
+            Ok(Session {
+                id: row.get(0)?,
+                timestamp: row.get(1)?,
+                command: row.get(2)?,
+                cwd: row.get(3)?,
+                exit_code: row.get(4)?,
+                git_branch: row.get(5)?,
+                stdout: row.get(6)?,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect()
+    };
+
+    Ok(rows)
 }
 
 fn run_tui(sessions: Vec<Session>, query: &str) -> io::Result<()> {
@@ -150,13 +205,13 @@ fn run_tui(sessions: Vec<Session>, query: &str) -> io::Result<()> {
                 .constraints([
                     Constraint::Length(3),
                     Constraint::Min(0),
-                    Constraint::Length(5),
+                    Constraint::Length(6),
                 ])
                 .split(f.size());
 
             // ── Header ──
             let header = Paragraph::new(format!(
-                " recall  searching: \"{}\"  ({} results)",
+                " recall  query: \"{}\"  ({} results)  [↑↓] navigate  [q] quit",
                 query,
                 sessions.len()
             ))
@@ -188,7 +243,7 @@ fn run_tui(sessions: Vec<Session>, query: &str) -> io::Result<()> {
                             Span::styled(status_char, Style::default().fg(status_color)),
                             Span::raw("  "),
                             Span::styled(
-                                &s.command,
+                                s.command.clone(),
                                 Style::default()
                                     .fg(Color::White)
                                     .add_modifier(Modifier::BOLD),
@@ -201,7 +256,7 @@ fn run_tui(sessions: Vec<Session>, query: &str) -> io::Result<()> {
                                 Style::default().fg(Color::DarkGray),
                             ),
                             Span::raw("  "),
-                            Span::styled(&s.cwd, Style::default().fg(Color::Blue)),
+                            Span::styled(s.cwd.clone(), Style::default().fg(Color::Blue)),
                             Span::styled(git_info, Style::default().fg(Color::Yellow)),
                         ]),
                     ])
@@ -221,9 +276,19 @@ fn run_tui(sessions: Vec<Session>, query: &str) -> io::Result<()> {
             // ── Detail panel ──
             let detail_text = if let Some(i) = list_state.selected() {
                 if let Some(s) = sessions.get(i) {
+                    let stdout_preview = if s.stdout.is_empty() {
+                        "(no output captured)".to_string()
+                    } else {
+                        s.stdout.lines().take(2).collect::<Vec<_>>().join(" | ")
+                    };
                     format!(
-                        " ID: {}  |  Exit: {}  |  Host: {}\n Command: {}\n Dir:     {}",
-                        s.id, s.exit_code, "kali", s.command, s.cwd,
+                        " ID: {}  |  Exit: {}  |  {}\n Command: {}\n Dir:     {}\n Output:  {}",
+                        s.id,
+                        s.exit_code,
+                        format_time(s.timestamp),
+                        s.command,
+                        s.cwd,
+                        stdout_preview,
                     )
                 } else {
                     String::new()
@@ -265,29 +330,62 @@ fn run_tui(sessions: Vec<Session>, query: &str) -> io::Result<()> {
     Ok(())
 }
 
+fn print_plain(sessions: &[Session], query: &str) {
+    if sessions.is_empty() {
+        println!("No results for '{}'", query);
+        return;
+    }
+    for s in sessions {
+        println!("─────────────────────────────");
+        println!("ID:      {}", s.id);
+        println!("When:    {}", format_time(s.timestamp));
+        println!("Command: {}", s.command);
+        println!("Dir:     {}", s.cwd);
+        println!(
+            "Status:  {}",
+            if s.exit_code == 0 {
+                "✓ success"
+            } else {
+                "✗ failed"
+            }
+        );
+    }
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     let db_path = get_db_path();
     let conn = Connection::open(&db_path)?;
     init_db(&conn)?;
 
-    match args.get(1).map(|s| s.as_str()) {
-        Some("capture") => {
-            capture_session(&conn, &args)?;
-        }
-        Some(query) => {
-            let full_query = args[1..].join(" ");
-            let sessions = search_sessions(&conn, &full_query)?;
-            if sessions.is_empty() {
-                println!("No results for '{}'", full_query);
-            } else {
-                run_tui(sessions, &full_query).unwrap();
-            }
-        }
-        None => {
-            println!("Usage:");
-            println!("  recall <query>    — search your history");
-        }
+    // recall capture <cmd> <cwd> <exit> <branch> <repo> <duration> <stdout> <stderr>
+    if args.get(1).map(|s| s.as_str()) == Some("capture") {
+        return capture_session(&conn, &args);
+    }
+
+    // Parse flags
+    let failed_only = args.contains(&"--failed".to_string());
+    let today_only = args.contains(&"--today".to_string());
+
+    // Collect query words (skip flags)
+    let query_words: Vec<String> = args[1..]
+        .iter()
+        .filter(|a| !a.starts_with("--"))
+        .cloned()
+        .collect();
+
+    let query = if query_words.is_empty() {
+        "%".to_string()
+    } else {
+        query_words.join(" ")
+    };
+
+    let sessions = search_sessions(&conn, &query, failed_only, today_only)?;
+
+    if sessions.is_empty() {
+        println!("No results for '{}'", query);
+    } else {
+        run_tui(sessions, &query).unwrap();
     }
 
     Ok(())
