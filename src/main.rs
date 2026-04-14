@@ -57,14 +57,14 @@ fn init_db(conn: &Connection) -> Result<()> {
 }
 
 fn capture_session(conn: &Connection, args: &[String]) -> Result<()> {
-    let command = args.get(2).cloned().unwrap_or_default();
+    let command = redact(&args.get(2).cloned().unwrap_or_default());
     let cwd = args.get(3).cloned().unwrap_or_default();
     let exit_code = args.get(4).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
     let git_branch = args.get(5).cloned().unwrap_or_default();
     let git_repo = args.get(6).cloned().unwrap_or_default();
     let duration = args.get(7).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
-    let stdout = args.get(8).cloned().unwrap_or_default();
-    let stderr = args.get(9).cloned().unwrap_or_default();
+    let stdout = redact(&args.get(8).cloned().unwrap_or_default());
+    let stderr = redact(&args.get(9).cloned().unwrap_or_default());
 
     if command.is_empty() {
         return Ok(());
@@ -109,6 +109,37 @@ fn format_time(timestamp_ms: i64) -> String {
         .unwrap_or_default()
         .with_timezone(&Local);
     dt.format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+fn redact(text: &str) -> String {
+    use regex::Regex;
+
+    // Patterns that indicate secrets
+    let patterns = vec![
+        // AWS keys
+        r"AKIA[0-9A-Z]{16}",
+        // GitHub tokens
+        r"gh[pousr]_[A-Za-z0-9]{36,}",
+        // Generic API keys — sk-, xoxb-, xoxp-
+        r"sk-[A-Za-z0-9]{32,}",
+        r"xox[bpra]-[A-Za-z0-9\-]{10,}",
+        // JWT tokens (three base64 parts separated by dots)
+        r"eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+",
+        // Passwords in common patterns like password=abc123
+        r"(?i)(password|passwd|secret|token|api_key|apikey|auth)[\s]*[=:]+[\s]*\S+",
+        // Long hex strings (32+ chars) — common for secrets
+        r"\b[0-9a-fA-F]{32,}\b",
+        // Bearer tokens
+        r"(?i)bearer\s+[A-Za-z0-9\-_\.]+",
+    ];
+
+    let mut result = text.to_string();
+    for pattern in patterns {
+        if let Ok(re) = Regex::new(pattern) {
+            result = re.replace_all(&result, "[REDACTED]").to_string();
+        }
+    }
+    result
 }
 
 fn search_sessions(
