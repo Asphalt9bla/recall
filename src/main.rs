@@ -43,7 +43,6 @@ fn init_db(conn: &Connection) -> Result<()> {
     ",
     )?;
 
-    // Handle migrations
     let columns: Result<Vec<String>> = conn
         .prepare("PRAGMA table_info(sessions)")?
         .query_map([], |row| row.get(1))?
@@ -102,6 +101,7 @@ struct Session {
     exit_code: i64,
     git_branch: String,
     stdout: String,
+    duration_ms: i64,
 }
 
 fn format_time(timestamp_ms: i64) -> String {
@@ -132,7 +132,7 @@ fn search_sessions(
 
     let sql = format!(
         "SELECT id, timestamp, command, cwd, exit_code,
-                COALESCE(git_branch,''), COALESCE(stdout,'')
+                COALESCE(git_branch,''), COALESCE(stdout,''), COALESCE(duration_ms,0)
          FROM sessions
          WHERE (command LIKE ?1 OR COALESCE(stdout,'') LIKE ?1)
          {}
@@ -163,6 +163,7 @@ fn search_sessions(
                 exit_code: row.get(4)?,
                 git_branch: row.get(5)?,
                 stdout: row.get(6)?,
+                duration_ms: row.get(7)?,
             })
         })?
         .filter_map(|r| r.ok())
@@ -177,6 +178,7 @@ fn search_sessions(
                 exit_code: row.get(4)?,
                 git_branch: row.get(5)?,
                 stdout: row.get(6)?,
+                duration_ms: row.get(7)?,
             })
         })?
         .filter_map(|r| r.ok())
@@ -215,11 +217,7 @@ fn run_tui(sessions: Vec<Session>, query: &str) -> io::Result<()> {
                 query,
                 sessions.len()
             ))
-            .style(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )
+            .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
             .block(Block::default().borders(Borders::ALL));
             f.render_widget(header, chunks[0]);
 
@@ -227,12 +225,8 @@ fn run_tui(sessions: Vec<Session>, query: &str) -> io::Result<()> {
             let items: Vec<ListItem> = sessions
                 .iter()
                 .map(|s| {
-                    let status_color = if s.exit_code == 0 {
-                        Color::Green
-                    } else {
-                        Color::Red
-                    };
-                    let status_char = if s.exit_code == 0 { "✓" } else { "✗" };
+                    let status_color = if s.exit_code == 0 { Color::Green } else { Color::Red };
+                    let status_char  = if s.exit_code == 0 { "✓" } else { "✗" };
                     let git_info = if !s.git_branch.is_empty() {
                         format!(" [{}]", s.git_branch)
                     } else {
@@ -244,9 +238,7 @@ fn run_tui(sessions: Vec<Session>, query: &str) -> io::Result<()> {
                             Span::raw("  "),
                             Span::styled(
                                 s.command.clone(),
-                                Style::default()
-                                    .fg(Color::White)
-                                    .add_modifier(Modifier::BOLD),
+                                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
                             ),
                         ]),
                         Line::from(vec![
@@ -266,9 +258,7 @@ fn run_tui(sessions: Vec<Session>, query: &str) -> io::Result<()> {
             let list = List::new(items)
                 .block(Block::default().borders(Borders::ALL).title(" results "))
                 .highlight_style(
-                    Style::default()
-                        .bg(Color::DarkGray)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD),
                 )
                 .highlight_symbol("▶ ");
             f.render_stateful_widget(list, chunks[1], &mut list_state);
@@ -281,11 +271,17 @@ fn run_tui(sessions: Vec<Session>, query: &str) -> io::Result<()> {
                     } else {
                         s.stdout.lines().take(2).collect::<Vec<_>>().join(" | ")
                     };
+                    let duration_str = if s.duration_ms > 0 {
+                        format!("{}s", s.duration_ms)
+                    } else {
+                        "<1s".to_string()
+                    };
                     format!(
-                        " ID: {}  |  Exit: {}  |  {}\n Command: {}\n Dir:     {}\n Output:  {}",
+                        " ID: {}  |  Exit: {}  |  {}  |  {}\n Command: {}\n Dir:     {}\n Output:  {}",
                         s.id,
                         s.exit_code,
                         format_time(s.timestamp),
+                        duration_str,
                         s.command,
                         s.cwd,
                         stdout_preview,
@@ -330,44 +326,19 @@ fn run_tui(sessions: Vec<Session>, query: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn print_plain(sessions: &[Session], query: &str) {
-    if sessions.is_empty() {
-        println!("No results for '{}'", query);
-        return;
-    }
-    for s in sessions {
-        println!("─────────────────────────────");
-        println!("ID:      {}", s.id);
-        println!("When:    {}", format_time(s.timestamp));
-        println!("Command: {}", s.command);
-        println!("Dir:     {}", s.cwd);
-        println!(
-            "Status:  {}",
-            if s.exit_code == 0 {
-                "✓ success"
-            } else {
-                "✗ failed"
-            }
-        );
-    }
-}
-
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     let db_path = get_db_path();
     let conn = Connection::open(&db_path)?;
     init_db(&conn)?;
 
-    // recall capture <cmd> <cwd> <exit> <branch> <repo> <duration> <stdout> <stderr>
     if args.get(1).map(|s| s.as_str()) == Some("capture") {
         return capture_session(&conn, &args);
     }
 
-    // Parse flags
     let failed_only = args.contains(&"--failed".to_string());
     let today_only = args.contains(&"--today".to_string());
 
-    // Collect query words (skip flags)
     let query_words: Vec<String> = args[1..]
         .iter()
         .filter(|a| !a.starts_with("--"))
