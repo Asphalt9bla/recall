@@ -495,6 +495,56 @@ fn run_tui(sessions: Vec<Session>, query: &str, config: &Config) -> io::Result<(
     Ok(())
 }
 
+fn replay_session(conn: &Connection, id: i64) -> Result<()> {
+    let mut stmt = conn.prepare("SELECT command, cwd FROM sessions WHERE id = ?1")?;
+
+    let result = stmt.query_row([id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    });
+
+    match result {
+        Ok((command, cwd)) => {
+            println!("┌─────────────────────────────────────────┐");
+            println!("  Command:   {}", command);
+            println!("  Directory: {}", cwd);
+            println!("└─────────────────────────────────────────┘");
+            print!("Run this command? [y/n]: ");
+
+            use std::io::Write;
+            io::stdout().flush().unwrap();
+
+            let mut input = String::new();
+            io::stdin().read_line(&mut input).unwrap();
+
+            if input.trim().to_lowercase() == "y" {
+                let status = std::process::Command::new("bash")
+                    .arg("-c")
+                    .arg(&command)
+                    .current_dir(&cwd)
+                    .status();
+
+                match status {
+                    Ok(s) => {
+                        if s.success() {
+                            println!("✓ Command completed successfully.");
+                        } else {
+                            println!("✗ Command exited with code: {}", s.code().unwrap_or(-1));
+                        }
+                    }
+                    Err(e) => println!("Failed to run command: {}", e),
+                }
+            } else {
+                println!("Aborted.");
+            }
+        }
+        Err(_) => {
+            println!("No session found with ID {}", id);
+        }
+    }
+
+    Ok(())
+}
+
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 fn main() -> Result<()> {
@@ -506,6 +556,17 @@ fn main() -> Result<()> {
 
     if args.get(1).map(|s| s.as_str()) == Some("capture") {
         return capture_session(&conn, &args, &config);
+    }
+
+    if args.get(1).map(|s| s.as_str()) == Some("replay") {
+        let id = args.get(2).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+        if id == 0 {
+            println!("Usage: recall replay <id>");
+            println!("Find IDs by searching: recall <query>");
+        } else {
+            replay_session(&conn, id)?;
+        }
+        return Ok(());
     }
 
     let failed_only = args.contains(&"--failed".to_string());
