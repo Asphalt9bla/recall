@@ -12,3 +12,4 @@ chrono = "0.4"
 regex = "1"
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }
+fastembed = "4"

@@ -4,6 +4,7 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
@@ -145,6 +146,15 @@ fn init_db(conn: &Connection) -> Result<()> {
         let _ = conn.execute("ALTER TABLE sessions ADD COLUMN tags TEXT", []);
     }
 
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS embeddings (
+            session_id  INTEGER PRIMARY KEY,
+            vector      BLOB NOT NULL
+        );
+    ",
+    )?;
+
     Ok(())
 }
 
@@ -164,7 +174,6 @@ fn redact(text: &str, extra_patterns: &[String]) -> String {
         r"(?i)bearer\s+[A-Za-z0-9\-_\.]+".to_string(),
     ];
 
-    // Add user-defined patterns from config
     builtin_patterns.extend_from_slice(extra_patterns);
 
     let mut result = text.to_string();
@@ -201,14 +210,12 @@ fn capture_session(conn: &Connection, args: &[String], config: &Config) -> Resul
         return Ok(());
     }
 
-    // Check excluded commands
     for excluded in &config.capture.exclude_commands {
         if command == *excluded || command.starts_with(&format!("{} ", excluded)) {
             return Ok(());
         }
     }
 
-    // Check excluded directories
     for excluded_dir in &config.capture.exclude_dirs {
         if cwd.starts_with(excluded_dir.as_str()) {
             return Ok(());
@@ -235,6 +242,7 @@ fn capture_session(conn: &Connection, args: &[String], config: &Config) -> Resul
             hostname, "bash"
         ],
     )?;
+
     Ok(())
 }
 
@@ -256,6 +264,77 @@ fn format_time(timestamp_ms: i64) -> String {
         .unwrap_or_default()
         .with_timezone(&Local);
     dt.format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+// ── Embeddings ───────────────────────────────────────────────────────────────
+
+fn get_embedding_model() -> Option<TextEmbedding> {
+    TextEmbedding::try_new(
+        InitOptions::new(EmbeddingModel::AllMiniLML6V2).with_show_download_progress(false),
+    )
+    .ok()
+}
+
+fn embed_and_store(conn: &Connection, session_id: i64, text: &str) {
+    if let Some(model) = get_embedding_model() {
+        if let Ok(embeddings) = model.embed(vec![text], None) {
+            if let Some(vector) = embeddings.into_iter().next() {
+                let bytes: Vec<u8> = vector.iter().flat_map(|f| f.to_le_bytes()).collect();
+                let _ = conn.execute(
+                    "INSERT OR REPLACE INTO embeddings (session_id, vector) VALUES (?1, ?2)",
+                    rusqlite::params![session_id, bytes],
+                );
+            }
+        }
+    }
+}
+
+fn index_all_sessions(conn: &Connection) {
+    let model = match get_embedding_model() {
+        Some(m) => m,
+        None => {
+            println!("Failed to load embedding model.");
+            return;
+        }
+    };
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, command, cwd FROM sessions
+         WHERE id NOT IN (SELECT session_id FROM embeddings)",
+        )
+        .unwrap();
+
+    let rows: Vec<(i64, String, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let total = rows.len();
+    if total == 0 {
+        println!("All sessions already indexed.");
+        return;
+    }
+
+    println!("Indexing {} sessions...", total);
+
+    for (i, (id, command, cwd)) in rows.iter().enumerate() {
+        let text = command.clone();
+        if let Ok(embeddings) = model.embed(vec![text.as_str()], None) {
+            if let Some(vector) = embeddings.into_iter().next() {
+                let bytes: Vec<u8> = vector.iter().flat_map(|f| f.to_le_bytes()).collect();
+                let _ = conn.execute(
+                    "INSERT OR REPLACE INTO embeddings (session_id, vector) VALUES (?1, ?2)",
+                    rusqlite::params![id, bytes],
+                );
+            }
+        }
+        print!("\r  {}/{}", i + 1, total);
+        use std::io::Write;
+        io::stdout().flush().unwrap();
+    }
+    println!("\nDone. {} sessions indexed.", total);
 }
 
 // ── Search ───────────────────────────────────────────────────────────────────
@@ -339,6 +418,65 @@ fn search_sessions(
     Ok(rows)
 }
 
+fn semantic_search(conn: &Connection, query: &str, limit: usize) -> Vec<i64> {
+    let model = match get_embedding_model() {
+        Some(m) => m,
+        None => return vec![],
+    };
+
+    let query_embedding = match model.embed(vec![query], None) {
+        Ok(e) => e.into_iter().next().unwrap_or_default(),
+        Err(_) => return vec![],
+    };
+
+    let mut stmt = match conn.prepare("SELECT session_id, vector FROM embeddings") {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+    });
+
+    let rows = match rows {
+        Ok(r) => r,
+        Err(_) => return vec![],
+    };
+
+    let mut scored: Vec<(i64, f32)> = rows
+        .filter_map(|r| r.ok())
+        .map(|(id, bytes)| {
+            let vector: Vec<f32> = bytes
+                .chunks(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect();
+
+            let dot: f32 = query_embedding
+                .iter()
+                .zip(vector.iter())
+                .map(|(a, b)| a * b)
+                .sum();
+            let mag_a: f32 = query_embedding.iter().map(|a| a * a).sum::<f32>().sqrt();
+            let mag_b: f32 = vector.iter().map(|b| b * b).sum::<f32>().sqrt();
+            let similarity = if mag_a > 0.0 && mag_b > 0.0 {
+                dot / (mag_a * mag_b)
+            } else {
+                0.0
+            };
+
+            (id, similarity)
+        })
+        .collect();
+
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    scored
+        .into_iter()
+        .filter(|(_, score)| *score > 0.15) // only return meaningful matches
+        .take(limit)
+        .map(|(id, _)| id)
+        .collect()
+}
+
 // ── TUI ──────────────────────────────────────────────────────────────────────
 
 fn run_tui(sessions: Vec<Session>, query: &str, config: &Config) -> io::Result<()> {
@@ -364,7 +502,6 @@ fn run_tui(sessions: Vec<Session>, query: &str, config: &Config) -> io::Result<(
                 ])
                 .split(f.size());
 
-            // ── Header ──
             let header = Paragraph::new(format!(
                 " recall  query: \"{}\"  ({} results)  [↑↓] navigate  [q] quit",
                 query,
@@ -378,7 +515,6 @@ fn run_tui(sessions: Vec<Session>, query: &str, config: &Config) -> io::Result<(
             .block(Block::default().borders(Borders::ALL));
             f.render_widget(header, chunks[0]);
 
-            // ── List ──
             let items: Vec<ListItem> = sessions
                 .iter()
                 .map(|s| {
@@ -428,7 +564,6 @@ fn run_tui(sessions: Vec<Session>, query: &str, config: &Config) -> io::Result<(
                 .highlight_symbol("▶ ");
             f.render_stateful_widget(list, chunks[1], &mut list_state);
 
-            // ── Detail panel ──
             let detail_text = if let Some(i) = list_state.selected() {
                 if let Some(s) = sessions.get(i) {
                     let stdout_preview = if s.stdout.is_empty() {
@@ -495,6 +630,8 @@ fn run_tui(sessions: Vec<Session>, query: &str, config: &Config) -> io::Result<(
     Ok(())
 }
 
+// ── Replay ───────────────────────────────────────────────────────────────────
+
 fn replay_session(conn: &Connection, id: i64) -> Result<()> {
     let mut stmt = conn.prepare("SELECT command, cwd FROM sessions WHERE id = ?1")?;
 
@@ -537,9 +674,7 @@ fn replay_session(conn: &Connection, id: i64) -> Result<()> {
                 println!("Aborted.");
             }
         }
-        Err(_) => {
-            println!("No session found with ID {}", id);
-        }
+        Err(_) => println!("No session found with ID {}", id),
     }
 
     Ok(())
@@ -562,15 +697,21 @@ fn main() -> Result<()> {
         let id = args.get(2).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
         if id == 0 {
             println!("Usage: recall replay <id>");
-            println!("Find IDs by searching: recall <query>");
         } else {
             replay_session(&conn, id)?;
         }
         return Ok(());
     }
 
+    if args.get(1).map(|s| s.as_str()) == Some("index") {
+        println!("Loading embedding model...");
+        index_all_sessions(&conn);
+        return Ok(());
+    }
+
     let failed_only = args.contains(&"--failed".to_string());
     let today_only = args.contains(&"--today".to_string());
+    let semantic = args.contains(&"--semantic".to_string());
 
     let query_words: Vec<String> = args[1..]
         .iter()
@@ -584,13 +725,54 @@ fn main() -> Result<()> {
         query_words.join(" ")
     };
 
-    let sessions = search_sessions(
-        &conn,
-        &query,
-        failed_only,
-        today_only,
-        config.search.max_results,
-    )?;
+    let sessions = if semantic {
+        println!("Loading semantic search model...");
+        let ids = semantic_search(&conn, &query, config.search.max_results);
+        if ids.is_empty() {
+            vec![]
+        } else {
+            let placeholders: String = ids
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("?{}", i + 1))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT id, timestamp, command, cwd, exit_code,
+                        COALESCE(git_branch,''), COALESCE(stdout,''), COALESCE(duration_ms,0)
+                 FROM sessions WHERE id IN ({})
+                 ORDER BY timestamp DESC",
+                placeholders
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let params: Vec<Box<dyn rusqlite::ToSql>> = ids
+                .iter()
+                .map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>)
+                .collect();
+            stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                Ok(Session {
+                    id: row.get(0)?,
+                    timestamp: row.get(1)?,
+                    command: row.get(2)?,
+                    cwd: row.get(3)?,
+                    exit_code: row.get(4)?,
+                    git_branch: row.get(5)?,
+                    stdout: row.get(6)?,
+                    duration_ms: row.get(7)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect()
+        }
+    } else {
+        search_sessions(
+            &conn,
+            &query,
+            failed_only,
+            today_only,
+            config.search.max_results,
+        )?
+    };
 
     if sessions.is_empty() {
         println!("No results for '{}'", query);
