@@ -360,7 +360,7 @@ fn search_sessions(
     };
 
     let sql = format!(
-        "SELECT id, timestamp, command, cwd, exit_code,
+        "SELECT id, timestamp, command, cwd, COALESCE(exit_code,0),
                 COALESCE(git_branch,''), COALESCE(stdout,''), COALESCE(duration_ms,0)
          FROM sessions
          WHERE (command LIKE ?1 OR COALESCE(stdout,'') LIKE ?1)
@@ -680,6 +680,80 @@ fn replay_session(conn: &Connection, id: i64) -> Result<()> {
     Ok(())
 }
 
+fn import_bash_history(conn: &Connection, config: &Config) {
+    let home = dirs::home_dir().unwrap_or_default();
+    let history_path = home.join(".bash_history");
+
+    let contents = match fs::read_to_string(&history_path) {
+        Ok(c) => c,
+        Err(_) => {
+            println!("Could not read ~/.bash_history");
+            return;
+        }
+    };
+
+    let commands: Vec<&str> = contents
+        .lines()
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+
+    let total = commands.len();
+    println!("Found {} commands in ~/.bash_history", total);
+
+    let timestamp_base = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+
+    let hostname = fs::read_to_string("/etc/hostname")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+
+    let mut imported = 0;
+    let mut skipped = 0;
+
+    for (i, command) in commands.iter().enumerate() {
+        let command = redact(command, &config.redaction.extra_patterns);
+
+        // Skip excluded commands
+        let mut excluded = false;
+        for exc in &config.capture.exclude_commands {
+            if command == *exc || command.starts_with(&format!("{} ", exc)) {
+                excluded = true;
+                break;
+            }
+        }
+        if excluded {
+            skipped += 1;
+            continue;
+        }
+
+        // Use slightly decreasing timestamps so order is preserved
+        let timestamp = timestamp_base - ((total - i) as i64 * 1000);
+
+        let result = conn.execute(
+            "INSERT INTO sessions
+                (timestamp, command, cwd, hostname, shell)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![timestamp, command, "~", hostname, "bash"],
+        );
+
+        match result {
+            Ok(_) => imported += 1,
+            Err(_) => skipped += 1,
+        }
+
+        if (i + 1) % 100 == 0 {
+            print!("\r  {}/{}", i + 1, total);
+            use std::io::Write;
+            io::stdout().flush().unwrap();
+        }
+    }
+
+    println!("\nDone. {} imported, {} skipped.", imported, skipped);
+}
+
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 fn main() -> Result<()> {
@@ -706,6 +780,12 @@ fn main() -> Result<()> {
     if args.get(1).map(|s| s.as_str()) == Some("index") {
         println!("Loading embedding model...");
         index_all_sessions(&conn);
+        return Ok(());
+    }
+
+    if args.get(1).map(|s| s.as_str()) == Some("import") {
+        println!("Importing ~/.bash_history...");
+        import_bash_history(&conn, &config);
         return Ok(());
     }
 
@@ -738,7 +818,7 @@ fn main() -> Result<()> {
                 .collect::<Vec<_>>()
                 .join(",");
             let sql = format!(
-                "SELECT id, timestamp, command, cwd, exit_code,
+                "SELECT id, timestamp, command, cwd, COALESCE(exit_code,0),
                         COALESCE(git_branch,''), COALESCE(stdout,''), COALESCE(duration_ms,0)
                  FROM sessions WHERE id IN ({})
                  ORDER BY timestamp DESC",
